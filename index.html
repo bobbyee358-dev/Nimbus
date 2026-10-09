@@ -100,7 +100,7 @@ h2{margin:0 0 10px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;
 .hour{flex:none;width:54px;display:flex;flex-direction:column;align-items:center;gap:4px;padding:6px 0;border-radius:10px;scroll-snap-align:start}
 .hour.first{background:var(--surface-2)}
 .hour .t{font-size:12px;color:var(--muted);white-space:nowrap}
-.hour .t.day{color:var(--fg);font-weight:650}
+.hour .t.newday{color:var(--fg);font-weight:650}
 .hour svg{width:28px;height:28px}
 .hour .tp{font-weight:600}
 .pop{font-size:11px;color:var(--cool);font-weight:600;min-height:15px}
@@ -504,7 +504,7 @@ function renderHours(d){
   for (let i = start; i < Math.min(start + 24, h.time.length); i++){
     const t = h.time[i], first = i === start, midnight = t.slice(11, 13) === "00";
     const cell = el("div", "hour" + (first ? " first" : ""));
-    cell.append(el("span", "t" + (midnight ? " day" : ""), first ? "Now" : midnight ? weekday(t.slice(0, 10)) : hourLabel(t)));
+    cell.append(el("span", "t" + (midnight ? " newday" : ""), first ? "Now" : midnight ? weekday(t.slice(0, 10)) : hourLabel(t)));
     cell.insertAdjacentHTML("beforeend", first ? icon(wx(d.current.weather_code)[1], d.current.is_day) : icon(wx(h.weather_code[i])[1], h.is_day[i]));
     cell.append(el("span", "tp num", Math.round(first ? d.current.temperature_2m : h.temperature_2m[i]) + "°"));
     const p = h.precipitation_probability[i];
@@ -545,29 +545,49 @@ async function loadAlerts(){
   const box = $("#alerts"); const { lat, lon } = S.loc;
   try {
     const j = await getJSON(`https://api.weather.gov/alerts/active?point=${lat},${lon}`, { headers: { Accept: "application/geo+json" } });
-    const feats = (j.features || []).sort((a, b) => (SEV_RANK[a.properties.severity] ?? 5) - (SEV_RANK[b.properties.severity] ?? 5));
+    const now = Date.now();
+    const all = j.features || [];
+    const superseded = new Set();
+    all.forEach((f) => (f.properties.references || []).forEach((r) => superseded.add(r.identifier)));
+    const live = all.filter((f) => {
+      const p = f.properties, end = Date.parse(p.ends || p.expires);
+      return !superseded.has(p.id) && !(end < now);
+    });
+    // One card per event + issuing office; every issuance stays readable inside it, newest first.
+    const groups = new Map();
+    live.forEach((f) => {
+      const k = f.properties.event + "|" + (f.properties.senderName || "");
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(f);
+    });
+    const feats = [...groups.values()].map((g) => g.sort((a, b) => Date.parse(b.properties.sent || 0) - Date.parse(a.properties.sent || 0)))
+      .sort((a, b) => (SEV_RANK[a[0].properties.severity] ?? 5) - (SEV_RANK[b[0].properties.severity] ?? 5));
     if (S.alertLayer) S.alertLayer.clearLayers();
     if (!feats.length){
       box.replaceChildren(el("p", "note", "No active National Weather Service alerts here · checked " + fmtClock(Date.now())));
       return;
     }
-    box.replaceChildren(...feats.map((f) => {
-      const p = f.properties, color = sevColor(p.event);
+    const fmtWhen = (iso) => new Date(iso).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+    box.replaceChildren(...feats.map((group) => {
+      const p = group[0].properties, color = sevColor(p.event);
       const det = el("details", "alert"); det.style.setProperty("--sev", color);
       const sum = el("summary");
       const end = p.ends || p.expires;
-      sum.append(el("span", "ev", p.event), el("span", "until", end ? "Until " + new Date(end).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" }) : (p.senderName || "")));
+      const extra = group.length > 1 ? ` · ${group.length} updates` : "";
+      sum.append(el("span", "ev", p.event), el("span", "until", (end ? "Until " + fmtWhen(end) : (p.senderName || "")) + extra));
       const body = el("div", "body");
-      if (p.headline) body.append(el("p", null, p.headline));
-      if (p.description){ body.append(el("h3", null, "Details"), el("div", null, p.description)); }
-      if (p.instruction){ body.append(el("h3", null, "What to do"), el("div", null, p.instruction)); }
+      group.forEach((f, i) => {
+        const q = f.properties;
+        if (group.length > 1) body.append(el("h3", null, (i === 0 ? "Latest · issued " : "Earlier · issued ") + (q.sent ? fmtWhen(q.sent) : "")));
+        if (q.headline) body.append(el("p", null, q.headline));
+        if (q.description){ body.append(el("h3", null, "Details"), el("div", null, q.description)); }
+        if (q.instruction){ body.append(el("h3", null, "What to do"), el("div", null, q.instruction)); }
+        if (f.geometry && S.alertLayer){
+          try { L.geoJSON(f.geometry, { style: { color: resolveVar(color), weight: 2, fillOpacity: 0.08 } }).addTo(S.alertLayer); } catch(e){}
+        }
+      });
       body.append(el("p", "note", p.senderName || "National Weather Service"));
       det.append(sum, body);
-      if (f.geometry && S.alertLayer){
-        try {
-          L.geoJSON(f.geometry, { style: { color: resolveVar(color), weight: 2, fillOpacity: 0.08 } }).addTo(S.alertLayer);
-        } catch(e){}
-      }
       return det;
     }));
   } catch(e){
